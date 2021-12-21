@@ -1,0 +1,30 @@
+postgresql:
+  replicaCount: 1
+  updateStrategyType: OnDelete
+  password: "CHANGEME"
+  database: cexplorer
+  usePasswordFile: false
+  repmgrUsername: repmgruser
+  repmgrPassword: "repmgrpassword"
+  repmgrDatabase: repmgrdatabase
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: k8s.dandelion.link/role
+            operator: In
+            values:
+            - single-node
+          - key: k8s.dandelion.link/cardano-network
+            operator: In
+            values:
+            - testnet
+pgpool:
+  customUsers:
+    usernames: 'dandelion_ro'
+    passwords: "CHANGEME"
+metrics:
+  enabled: true
+persistence:
+  size: "150Gi"
