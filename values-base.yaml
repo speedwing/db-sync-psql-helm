@@ -28,3 +28,6 @@ metrics:
   enabled: true
 persistence:
   size: "150Gi"
+
+dbsync:
+  restoreBackup: true

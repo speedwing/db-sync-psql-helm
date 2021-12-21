@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardano-db-sync-cm
+data:
+  POSTGRES_HOST: localhost
+  POSTGRES_HOST_RO: localhost
+  POSTGRES_HOST_RW: localhost
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: cexplorer
+  POSTGRES_USER: postgres
+  POSTGRES_USER_RO: dandelion_ro
+  chisel-auth-file: |
+    {
+      "admin:CHANGEME": [""]
+    }
+  create-db-ro-user-entrypoint: |
+    while [ -z "$(psql -U ${POSTGRES_USER} -h ${POSTGRES_HOST} -c '\dt' ${POSTGRES_DB} | grep epoch)" ]
+    do
+      sleep 1
+    done
+    envsubst < /configmap/create-ro-user.sql.tpl > /tmp/create-ro-user.sql
+    psql -U ${POSTGRES_USER} -h ${POSTGRES_HOST} -f /tmp/create-ro-user.sql ${POSTGRES_DB}
+    psql -U ${POSTGRES_USER} -h ${POSTGRES_HOST} -f /configmap/extra.sql ${POSTGRES_DB}
+  create-ro-user.sql.tpl: |
+    CREATE ROLE ${POSTGRES_USER_RO};
+    GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO ${POSTGRES_USER_RO};
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_USER_RO};
+    GRANT USAGE ON SCHEMA public TO ${POSTGRES_USER_RO};
+    ALTER ROLE ${POSTGRES_USER_RO} WITH login;
+    ALTER USER ${POSTGRES_USER_RO} WITH PASSWORD '${POSTGRES_PASSWORD_RO}';
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA PUBLIC TO ${POSTGRES_USER_RO};
+  extra.sql: |
+    CREATE OR REPLACE FUNCTION get_tx_history_for_addresses(data json) RETURNS TABLE (tx_hash text, block uinteger, tx_timestamp timestamp) AS $$
+    DECLARE
+      addresses text[];
+    BEGIN
+      addresses := (SELECT array_agg(replace(rec::text, '"', ''))
+                    FROM json_array_elements(data->'addresses') rec);
+      RETURN QUERY (SELECT trim(txs.hash, '\\\\x') , txs.block_no, txs.time from (
+        SELECT
+          tx.id, tx.hash::text, block.block_no, block.hash::text as blockHash, block.time, tx.block_index
+          FROM block
+          INNER JOIN tx ON block.id = tx.block_id
+          INNER JOIN tx_out ON tx.id = tx_out.tx_id
+          WHERE tx_out.address = ANY(addresses)
+        UNION
+          SELECT DISTINCT
+            tx.id, tx.hash::text, block.block_no, block.hash::text as blockHash, block.time, tx.block_index
+            FROM block
+            INNER JOIN tx ON block.id = tx.block_id
+            INNER JOIN tx_in ON tx.id = tx_in.tx_in_id
+            INNER JOIN tx_out ON (tx_in.tx_out_id = tx_out.tx_id) AND (tx_in.tx_out_index = tx_out.index)
+            WHERE tx_out.address = ANY(addresses)
+            ORDER BY time DESC
+      ) AS txs);
+    END; $$ LANGUAGE PLPGSQL IMMUTABLE;
+
+    CREATE OR REPLACE FUNCTION get_eoe_balance_for_addresses(data json) RETURNS TABLE (balance numeric, address character varying) AS $$
+    DECLARE
+      addresses text[];
+      epoch int;
+    BEGIN
+      addresses := (SELECT array_agg(replace(rec::text, '"', ''))
+                    FROM json_array_elements(data->'addresses') rec);
+      SELECT json_extract_path_text(data, 'epoch') INTO epoch AS tmp;
+      RETURN QUERY (SELECT SUM(utxo_view.value), utxo_view.address FROM utxo_view
+        INNER JOIN tx ON tx.id = utxo_view.tx_id
+        INNER JOIN block ON block.id = tx.block_id
+        WHERE utxo_view.address = ANY(addresses)
+        AND block.slot_no <= (select get_last_slot_for_epoch(epoch))
+        GROUP BY utxo_view.address);
+    END; $$ LANGUAGE PLPGSQL IMMUTABLE;
+  initContainer-entrypoint: |
+    function finish-socat {
+      pkill -f socat && sleep 1
+      rm -f ${CARDANO_NODE_SOCKET_PATH}
+    }
+
+    trap finish-socat EXIT
+
+    echo -n "[+] Waiting for cardano-node to become available (socat approach makes db-sync to freeze if it's not)..."
+    while ! `echo > /dev/tcp/${CARDANO_NODE_SOCKET_TCP_HOST}/${CARDANO_NODE_SOCKET_TCP_PORT}`
+    do
+      sleep 1
+      echo -n .
+    done
+
+    rm -f ${CARDANO_NODE_SOCKET_PATH}
+    socat UNIX-LISTEN:${CARDANO_NODE_SOCKET_PATH},fork TCP:${CARDANO_NODE_SOCKET_TCP_HOST}:${CARDANO_NODE_SOCKET_TCP_PORT},ignoreeof &
+    while ! `timeout 10 cardano-cli query tip --mainnet 2>&1 | grep -q "epoch\|NodeToClientVersionData"`
+    do
+      sleep 1
+      echo -n .
+    done
+
+    cardano-cli query tip --mainnet
+    if [ $? -eq 0 ]
+    then
+      MAGIC_ARG="--mainnet"
+      S3_BUCKET_URI=${DB_SYNC_SNAPSHOT_MAINNET_S3_BUCKET_URI}
+    else
+      MAGIC_ARG="--testnet-magic $(cardano-cli query tip --mainnet 2>&1 | sed 's|\(.*NodeToClientVersionData.*\)unNetworkMagic = \(.*\)}}.*/=\(.*\)|\2|g' | xargs echo)"
+      S3_BUCKET_URI=${DB_SYNC_SNAPSHOT_TESTNET_S3_BUCKET_URI}
+    fi
+
+    if [ "${RESTORE_SNAPSHOT}" == "true" ]
+    then
+      until psql -P pager=off -U ${POSTGRES_USER} -h ${POSTGRES_HOST} -c '\dt' ${POSTGRES_DB}
+      do
+        sleep 1
+      done
+      if [ -z "$(psql -U ${POSTGRES_USER} -h ${POSTGRES_HOST} -c '\dt' ${POSTGRES_DB} | grep epoch)" ]
+      then
+        cd /aux-data-dir
+
+        read -d "\n" DB_SYNC_SNAPSHOT DB_SYNC_SNAPSHOT_SHA256_SUM <<<$(aws s3 ls --no-sign-request ${S3_BUCKET_URI} | awk '{print $NF}' | sort | tail -n2)
+
+        aws s3 cp --no-sign-request ${S3_BUCKET_URI}${DB_SYNC_SNAPSHOT} snapshot.tgz
+        aws s3 cp --no-sign-request ${S3_BUCKET_URI}${DB_SYNC_SNAPSHOT_SHA256_SUM} snapshot.tgz.sha256sum.tmp
+
+        echo $(awk '{print $1}' snapshot.tgz.sha256sum.tmp) snapshot.tgz > snapshot.tgz.sha256sum
+        sha256sum --check --status < snapshot.tgz.sha256sum
+        if [ $? -eq 0 ]
+        then
+          tar -zxf snapshot.tgz
+          psql -U ${POSTGRES_USER} -h ${POSTGRES_HOST} -f *sql ${POSTGRES_DB}
+          rm -f *sql
+          mv *state* /db-sync-statedir
+          chown -R root: /db-sync-statedir
+        else
+          echo "[!] sha256sum check error for ${S3_BUCKET_URI}${DB_SYNC_SNAPSHOT}"
+          exit 1
+        fi
+      fi
+    fi
+    DB_EPOCH=$(psql -U ${POSTGRES_USER} -h ${POSTGRES_HOST} -tA -P pager=off -c 'select no from epoch order by id desc limit 1;' ${POSTGRES_DB})
+    test -z "${DB_EPOCH}" && DB_EPOCH=0
+    echo -n "[+] Waiting for cardano-node to reach tip..."
+    while [[ -n $(cardano-cli query tip ${MAGIC_ARG} | jq .epoch) ]] && [ ${DB_EPOCH} -gt $(cardano-cli query tip ${MAGIC_ARG} | jq .epoch) ]
+    do
+      sleep 60
+      echo -n .
+    done
+
+  liveness-healthcheck: |
+    KUBE_API_URL=https://kubernetes.default.svc/api/v1/namespaces
+    KUBE_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+    SINCE_SECONDS=300
+    curl -m 30 -sSk -H "Authorization: Bearer $KUBE_TOKEN" "${KUBE_API_URL}/${NAMESPACE}/pods/cardano-db-sync-0/log?container=cardano-db-sync&sinceSeconds=${SINCE_SECONDS}" > /tmp/db-sync-log-tail 
+    if [ $? -ne 0 ]
+    then
+      exit 0
+    else
+      tail -n10 /tmp/db-sync-log-tail | grep -q "insertByronBlock\|insert.*Block.*epoch.*slot.*block.*hash\|getHistoryInterpreter\|Finishing epoch\|Starting epoch"
+    fi

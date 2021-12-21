@@ -401,7 +401,156 @@ spec:
         {{- if .Values.postgresql.sidecars }}
         {{- include "common.tplvalues.render" (dict "value" .Values.postgresql.sidecars "context" $) | nindent 8 }}
         {{- end }}
+        {{- if .Values.dbsync.restoreBackup }}
+        - name: configure
+          command: ["bash", "-x", "/configmap/initContainer-entrypoint"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 0
+          image: gimbalabs/cardano-db-sync-init-container:1.32.1-0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CARDANO_NODE_SOCKET_TCP_HOST
+              value: "cardano-node-headless"
+            - name: CARDANO_NODE_SOCKET_TCP_PORT
+              value: "30000"
+            - name: SOCAT_TIMEOUT
+              value: "3600"
+            - name: CARDANO_NODE_SOCKET_PATH
+              value: /ipc/node.socket
+            - name: RESTORE_SNAPSHOT
+              value: "true"
+            - name: DB_SYNC_SNAPSHOT_TESTNET_S3_BUCKET_URI
+              value: "s3://updates-cardano-testnet/cardano-db-sync/12/"
+            - name: DB_SYNC_SNAPSHOT_MAINNET_S3_BUCKET_URI
+              value: "s3://update-cardano-mainnet.iohk.io/cardano-db-sync/12/"
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: cardano-db-sync-cm
+                  key: POSTGRES_HOST_RW
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: cardano-db-sync-cm
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: cardano-db-sync-cm
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: cardano-db-sync-cm
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: init0-postgresql-ha-postgresql
+                  key: postgresql-password
+            - name: POSTGRES_USER_RO
+              valueFrom:
+                secretKeyRef:
+                  name: init0-postgresql-ha-pgpool-custom-users
+                  key: usernames
+            - name: POSTGRES_PASSWORD_RO
+              valueFrom:
+                secretKeyRef:
+                  name: init0-postgresql-ha-pgpool-custom-users
+                  key: passwords
+          volumeMounts:
+            - name: cardano-db-sync-cm
+              mountPath: /configmap
+            - name: dbsync-statedir
+              mountPath: /db-sync-statedir
+            - name: node-ipc
+              mountPath: /aux-data-dir
+            - name: node-ipc
+              mountPath: /ipc
+        {{- else }}
+        - name: cardano-db-sync
+          env:
+          - name: EXTENDED
+            value: "true"
+          - name: NETWORK
+            value: mainnet
+          - name: POSTGRES_HOST
+            valueFrom:
+              configMapKeyRef:
+                name: cardano-db-sync-cm
+                key: POSTGRES_HOST
+          - name: POSTGRES_PORT
+            valueFrom:
+              configMapKeyRef:
+                name: cardano-db-sync-cm
+                key: POSTGRES_PORT
+          - name: POSTGRES_DB
+            valueFrom:
+              configMapKeyRef:
+                name: cardano-db-sync-cm
+                key: POSTGRES_DB
+          - name: POSTGRES_USER
+            valueFrom:
+              configMapKeyRef:
+                name: cardano-db-sync-cm
+                key: POSTGRES_USER
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: init0-postgresql-ha-postgresql
+                key: postgresql-password
+          image: gimbalabs/cardano-db-sync:11.0.4
+          workingDir: /var/lib/cdbsync
+          #command: ["sh", "-c", "while true; do sleep 6969; done"]
+          imagePullPolicy: IfNotPresent
+          resources: {}
+          volumeMounts:
+          - name: node-ipc
+            mountPath: /node-ipc
+          # workaround for missing tmp dir :facepalm:
+          - name: node-ipc
+            mountPath: /tmp
+          - name: cardano-db-sync-cm
+            mountPath: /run/secrets/cardano-db-sync-cm
+            readOnly: true
+          - name: postgres-password
+            mountPath: /run/secrets/postgres-password
+            readOnly: true
+          - name: dbsync-statedir
+            mountPath: /var/lib/cdbsync
+          - name: cardano-db-sync-cm
+            mountPath: /configmap
+        {{- end }}
+        - name: socat-socket-server
+          image: alpine/socat
+          env:
+            - name: CARDANO_NODE_SOCKET_TCP_HOST
+              value: "cardano-node-headless"
+            - name: CARDANO_NODE_SOCKET_TCP_PORT
+              value: "30000"
+            - name: SOCAT_TIMEOUT
+              value: "3600"
+          command: ["sh", "-c", "rm -f /ipc/node.socket; socat UNIX-LISTEN:/ipc/node.socket,fork TCP:${CARDANO_NODE_SOCKET_TCP_HOST}:${CARDANO_NODE_SOCKET_TCP_PORT},ignoreeof"]
+          #command: ["sh", "-c", "socat -d -d -d -d -v UNIX-LISTEN:/ipc/node.socket TCP:${CARDANO_NODE_SOCKET_TCP_HOST}:${CARDANO_NODE_SOCKET_TCP_PORT},ignoreeof,keepalive,keepidle=10,keepintvl=10,keepcnt=100"]
+          volumeMounts:
+            - mountPath: /ipc
+              name: node-ipc
       volumes:
+        - name: node-ipc
+          emptyDir: { }
+        - name: postgres-password
+          secret:
+            secretName: init0-postgresql-ha-postgresql
+            items:
+              - key: postgresql-password
+                path: POSTGRES_PASSWORD
+        - name: dbsync-statedir
+          persistentVolumeClaim:
+            claimName: dbsync-statedir
+        - name: cardano-db-sync-cm
+          configMap:
+            name: cardano-db-sync-cm
         {{- if .Values.postgresql.extraVolumes }}
         {{- include "common.tplvalues.render" (dict "value" .Values.postgresql.extraVolumes "context" $) | nindent 8 }}
         {{- end }}
@@ -462,4 +611,11 @@ spec:
         selector: {{- include "common.tplvalues.render" (dict "value" .Values.persistence.selector "context" $) | nindent 10 }}
         {{- end -}}
         {{- include "common.storage.class" (dict "persistence" .Values.persistence "global" .Values.global) | nindent 8 }}
+    - metadata:
+        name: dbsync-statedir
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 4Gi
   {{- end }}
